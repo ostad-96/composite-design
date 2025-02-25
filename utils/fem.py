@@ -1,3 +1,5 @@
+# fem.py
+# Requires FEniCS!
 from dolfin import *
 set_log_active(False)
 import numpy as np
@@ -110,8 +112,37 @@ def evaluate_composite(design):
     
     return -E_eff
 
+def voigt_model(phi):
+    """
+    Voigt Model (Upper Bound):
+    
+    E_Voigt = phi * E_STIFF + (1 - phi) * E_COMP
+    
+    Parameters:
+      phi : float
+          Volume fraction of the stiff material.
+    
+    Returns:
+      Upper bound for the effective modulus (MPa)
+    """
+    return phi * E_STIFF + (1 - phi) * E_COMP
+
+def reuss_model(phi):
+    """
+    Reuss Model (Lower Bound):
+    
+    E_Reuss = (E_STIFF * E_COMP) / (phi * E_COMP + (1 - phi) * E_STIFF)
+    
+    Parameters:
+      phi : float
+          Volume fraction of the stiff material.
+    
+    Returns:
+      Lower bound for the effective modulus (MPa)
+    """
+    return (E_STIFF * E_COMP) / (phi * E_COMP + (1 - phi) * E_STIFF)
+
 if __name__ == "__main__":
-    # Test the FEM evaluation with a sample design.
     sample_design = np.array([
         [0, 0, 0, 0, 0],
         [0, 0, 1, 0, 0],
@@ -120,5 +151,6 @@ if __name__ == "__main__":
         [0, 0, 0, 0, 0]
     ], dtype=np.float32)
     E_eff = evaluate_composite(sample_design)
-    vol_frac = np.sum(sample_design) / (MATRIX_SIZE * MATRIX_SIZE)
-    print(f"Effective Young's Modulus: {E_eff:.2f} MPa, Volume Fraction: {vol_frac:.2f}")
+    # Compute stiff material fraction
+    vol_frac_stiff = (MATRIX_SIZE * MATRIX_SIZE - np.sum(sample_design)) / (MATRIX_SIZE * MATRIX_SIZE)
+    print(f"Effective Young's Modulus: {E_eff:.2f} MPa, Stiff Volume Fraction: {vol_frac_stiff:.2f}")

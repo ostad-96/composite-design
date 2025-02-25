@@ -1,4 +1,5 @@
-from utils.dqn import train
+from utils.trainer import Trainer
 
 if __name__ == "__main__":
-    train()
+    trainer = Trainer()
+    trainer.train()

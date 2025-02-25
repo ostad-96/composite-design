@@ -7,13 +7,11 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from utils.fem import evaluate_composite
-from tqdm import tqdm
+from utils.fem import evaluate_composite, voigt_model, reuss_model
 
-from config import (MATRIX_SIZE, DESIRED_MODULUS, DESIRED_VOL_FRAC, MAX_STEPS,
+from config import (MATRIX_SIZE, MAX_STEPS,
                     LEARNING_RATE, BATCH_SIZE, GAMMA, EPSILON_DECAY, EPSILON_MIN,
-                    FIRST_HIDDEN_NEURONS, SECOND_HIDDEN_NEURONS,
-                    NUM_CYCLES, EPISODES_PER_CYCLE, OPT_STEPS_PER_CYCLE, E_STIFF, E_COMP)
+                    FIRST_HIDDEN_NEURONS, SECOND_HIDDEN_NEURONS, E_STIFF, E_COMP)
 
 # -------------------------------
 # Environment Setup
@@ -25,15 +23,15 @@ class CompositeDesignEnv(gym.Env):
     The design is a MATRIX_SIZE × MATRIX_SIZE binary grid.
     The state is a vector of length (MATRIX_SIZE² + 4), where:
       - First MATRIX_SIZE² entries: the design (0: stiff, 1: compliant).
-      - The last 4 entries: current effective modulus (scaled), current volume fraction,
-        desired modulus (scaled), and desired volume fraction.
+      - The last 4 entries: current effective modulus (scaled), current stiff volume fraction,
+        target effective modulus (scaled), and target stiff volume fraction.
     
     Actions (Discrete MATRIX_SIZE² + 1):
       - 0 to MATRIX_SIZE² - 1: flip the corresponding cell.
       - Last action: null action (do nothing).
     
-    Reward: 0 if the effective modulus is within ±50 MPa of desired and volume fraction
-            is within ±0.04 of desired; -1 otherwise.
+    Reward: 0 if the effective modulus is within ±50 MPa of target and stiff volume fraction
+            is within ±0.04 of target; -1 otherwise.
     
     Each episode is limited to MAX_STEPS.
     """
@@ -43,30 +41,38 @@ class CompositeDesignEnv(gym.Env):
         self.num_cells = MATRIX_SIZE * MATRIX_SIZE
         self.max_steps = MAX_STEPS
         self.max_modulus = max(E_STIFF, E_COMP)
-        
-        # Desired properties
-        self.desired_modulus = DESIRED_MODULUS
-        self.desired_vol_frac = DESIRED_VOL_FRAC
+        # The target goals will be updated in each episode (reset)
+        self.desired_modulus = None
+        self.desired_vol_frac = None
         
         # Define action space: one action per cell + a null action.
         self.action_space = spaces.Discrete(self.num_cells + 1)
         # Observation: flattened grid (num_cells) plus 4 additional metrics.
         self.observation_space = spaces.Box(low=0.0, high=1.0, 
                                             shape=(self.num_cells + 4,), dtype=np.float32)
-        self.reset()
         self.saved_designs = []
         self.comp_des_num = 0
+        self.reset()
 
     def reset(self):
-        # Initialize a random MATRIX_SIZE×MATRIX_SIZE design (0: stiff, 1: compliant)
+        # 1. Instantiate a random design and evaluate its properties.
+        self.saved_designs = []
         self.grid = np.random.randint(0, 2, size=self.grid_size)
         self.current_step = 0
-
-        # Evaluate effective modulus using the FEM module
         self.current_modulus = evaluate_composite(self.grid)
-        # Compute current volume fraction (fraction of compliant cells)
-        self.current_vol_frac = np.sum(self.grid) / self.num_cells
+        self.current_vol_frac = (self.num_cells - np.sum(self.grid)) / self.num_cells
         
+        # 2. Sample new target parameters until the current modulus is at least 100 MPa away.
+        while True:
+            phi_goal = np.random.uniform(0, 1)  # target stiff material fraction
+            E_voigt = voigt_model(phi_goal)
+            E_reuss = reuss_model(phi_goal)
+            desired_modulus = np.random.uniform(E_reuss, E_voigt)
+            if abs(self.current_modulus - desired_modulus) >= 100:
+                break
+        self.desired_modulus = desired_modulus
+        self.desired_vol_frac = phi_goal
+
         return self._get_state()
     
     def _get_state(self):
@@ -78,7 +84,7 @@ class CompositeDesignEnv(gym.Env):
         ])
         return state.astype(np.float32)
     
-    def step(self, action):
+    def step(self, action, plot=0):
         self.current_step += 1
         # Flip a cell if action is less than num_cells
         if action < self.num_cells:
@@ -89,12 +95,13 @@ class CompositeDesignEnv(gym.Env):
         
         # Re-evaluate composite properties
         self.current_modulus = evaluate_composite(self.grid)
-        self.current_vol_frac = np.sum(self.grid) / self.num_cells
-        # Compute reward
+        self.current_vol_frac = (self.num_cells - np.sum(self.grid)) / self.num_cells
+        # Compute reward based on target modulus and stiff volume fraction
         if (abs(self.current_modulus - self.desired_modulus) <= 50) and \
            (abs(self.current_vol_frac - self.desired_vol_frac) <= 0.04):
             reward = 0.0
-            self.render()  # Render only on satisfying design
+            if plot == 1: # Render only on satisfying design and when plot=1
+                self.render()  
         else:
             reward = -1.0
         done = self.current_step >= self.max_steps
@@ -111,11 +118,11 @@ class CompositeDesignEnv(gym.Env):
         self.saved_designs.append(self.grid.copy())
         self.comp_des_num += 1
         plt.imshow(self.grid, cmap='gray', vmin=0, vmax=1)
-        # Annotate the plot with effective modulus and volume fraction.
+        # Annotate the plot with both current and target values.
         title_str = (
             f"Composite Design (0: Stiff, 1: Compliant)\n"
-            f"Effective Modulus: {self.current_modulus:.2f} MPa\n"
-            f"Volume Fraction: {self.current_vol_frac:.2f}"
+            f"Current E: {self.current_modulus:.2f} MPa, Current VF: {self.current_vol_frac:.2f}\n"
+            f"Target E: {self.desired_modulus:.2f} MPa, Target VF: {self.desired_vol_frac:.2f}"
         )
         plt.title(title_str)
         plt.colorbar()
@@ -227,44 +234,3 @@ class DQNAgent:
     
     def decay_epsilon(self):
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
-
-# -------------------------------
-# Training Loop
-# -------------------------------
-def train():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    env = CompositeDesignEnv()
-    agent = DQNAgent(device)
-    
-    episode_rewards = []
-    
-    for cycle in tqdm(range(NUM_CYCLES)):
-        for ep in range(EPISODES_PER_CYCLE):
-            state = env.reset()
-            done = False
-            ep_reward = 0
-            while not done:
-                action = agent.select_action(state)
-                next_state, reward, done, _ = env.step(action)
-                agent.replay_buffer.push(state, action, reward, next_state, done)
-                state = next_state
-                ep_reward += reward
-            agent.decay_epsilon()
-            episode_rewards.append(ep_reward)
-            if (cycle * EPISODES_PER_CYCLE + ep + 1) % 2000 == 0:
-                print(f"Episode {cycle * EPISODES_PER_CYCLE + ep + 1}")
-                env.render()
-        for _ in range(OPT_STEPS_PER_CYCLE):
-            agent.update()
-        agent.soft_update_target()
-        print(f"Cycle {cycle+1}/{NUM_CYCLES} completed. Last episode reward: {ep_reward} Epsilon: {agent.epsilon:.3f}")
-    
-    plt.plot(episode_rewards)
-    plt.xlabel("Episode")
-    plt.ylabel("Total Reward")
-    plt.title("Training Rewards")
-    plt.show()
-
-if __name__ == "__main__":
-    print(MAX_STEPS)
-    train()
