@@ -59,19 +59,19 @@ class CompositeDesignEnv(gym.Env):
         self.saved_designs = []
         self.grid = np.random.randint(0, 2, size=self.grid_size)
         self.current_step = 0
-        self.current_modulus = evaluate_composite(self.grid)
+        # self.current_modulus = evaluate_composite(self.grid)
         self.current_vol_frac = (self.num_cells - np.sum(self.grid)) / self.num_cells
-        
+        self.current_modulus = (voigt_model(self.current_vol_frac) + reuss_model(self.current_vol_frac)) / 2
         # 2. Sample new target parameters until the current modulus is at least 100 MPa away.
         while True:
             phi_goal = np.random.uniform(0, 1)  # target stiff material fraction
             E_voigt = voigt_model(phi_goal)
             E_reuss = reuss_model(phi_goal)
-            desired_modulus = np.random.uniform(E_reuss, E_voigt)
+            desired_modulus = (E_voigt + E_reuss) / 2
             if abs(self.current_modulus - desired_modulus) >= 100:
                 break
         self.desired_modulus = desired_modulus
-        self.desired_vol_frac = phi_goal
+        self.desired_vol_frac = phi_goal 
 
         return self._get_state()
     
@@ -84,6 +84,18 @@ class CompositeDesignEnv(gym.Env):
         ])
         return state.astype(np.float32)
     
+    def compute_reward(self, current_modulus, current_vol_frac, desired_modulus, desired_vol_frac):
+        """
+        Returns the reward for being at (current_modulus, current_vol_frac)
+        given the target (desired_modulus, desired_vol_frac).
+        """
+        # Example rule: 0 if close enough, else -1
+        if (abs(current_modulus - desired_modulus) <= 50) and \
+        (abs(current_vol_frac - desired_vol_frac) <= 0.04):
+            return 0.0
+        else:
+            return -1.0
+    
     def step(self, action, plot=0):
         self.current_step += 1
         # Flip a cell if action is less than num_cells
@@ -94,16 +106,16 @@ class CompositeDesignEnv(gym.Env):
         # Else: null action (do nothing)
         
         # Re-evaluate composite properties
-        self.current_modulus = evaluate_composite(self.grid)
+        # self.current_modulus = evaluate_composite(self.grid)
         self.current_vol_frac = (self.num_cells - np.sum(self.grid)) / self.num_cells
+        self.current_modulus = (voigt_model(self.current_vol_frac) + reuss_model(self.current_vol_frac)) / 2
         # Compute reward based on target modulus and stiff volume fraction
-        if (abs(self.current_modulus - self.desired_modulus) <= 50) and \
-           (abs(self.current_vol_frac - self.desired_vol_frac) <= 0.04):
-            reward = 0.0
-            if plot == 1: # Render only on satisfying design and when plot=1
-                self.render()  
-        else:
-            reward = -1.0
+        reward = self.compute_reward(
+            current_modulus  = self.current_modulus,
+            current_vol_frac = self.current_vol_frac,
+            desired_modulus  = self.desired_modulus,
+            desired_vol_frac = self.desired_vol_frac
+        )
         done = self.current_step >= self.max_steps
         return self._get_state(), reward, done, {}
     
@@ -146,20 +158,22 @@ class QNetwork(nn.Module):
             output_dim = MATRIX_SIZE * MATRIX_SIZE + 1
         self.fc1 = nn.Linear(input_dim, hidden_dim1)
         self.fc2 = nn.Linear(hidden_dim1, hidden_dim2)
-        self.out = nn.Linear(hidden_dim2, output_dim)
+        self.fc3 = nn.Linear(hidden_dim2, 128)
+        self.out = nn.Linear(128, output_dim)
     
     def forward(self, x):
         x = torch.relu(self.fc1(x))
         x = torch.relu(self.fc2(x))
+        x = torch.relu(self.fc3(x))
         return self.out(x)
 
 # -------------------------------
 # Replay Buffer
 # -------------------------------
 class ReplayBuffer:
-    def __init__(self, capacity=int(1e6)):
+    def __init__(self, capacity=int(8e6)):
         self.capacity = capacity
-        self.buffer = []
+        self.buffer = []  
         self.position = 0
     
     def push(self, state, action, reward, next_state, done):
