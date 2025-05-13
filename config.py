@@ -24,25 +24,24 @@ DESIRED_VOL_FRAC = 0.20
 # -------------------------------
 LEARNING_RATE = 1e-4
 TAU = 0.01
-BATCH_SIZE = 1024 # Smaller batch might be needed if CHW states are large in GPU memory
+BATCH_SIZE = 1024
 GAMMA = 0.99
 EPSILON_START = 1.0
 EPSILON_DECAY = 0.99995
 EPSILON_MIN = 0.02
+CLIP_GRAD_NORM_MAX = 1.0 # <<< Max norm for gradient clipping
 
 # -------------------------------
 # Q-Network architecture parameters
 # -------------------------------
 FCN_INPUT_CHANNELS = 4 # 1 (grid) + 3 (broadcasted: current_VF, scaled_step, scaled_dist_E)
-FCN_NUM_FILTERS_RESBLOCK = 8 # Default number of filters in ResBlocks (can be made tunable)
-FCN_NUM_RES_BLOCKS = 4 # Default number of ResBlocks (will be tuned by Optuna)
-FCN_KERNEL_SIZE = 3 # Default kernel size for ResBlocks (will be tuned by Optuna)
+FCN_NUM_FILTERS_RESBLOCK = 8
+FCN_NUM_RES_BLOCKS = 4
+FCN_KERNEL_SIZE = 3
 
-# Define dilation strategy choices for Optuna
 FCN_DILATION_STRATEGIES = ["all_ones", "progressive_trim", "cyclic_124"]
-# Max number of blocks for which 'progressive_trim' is designed
 FCN_DILATION_PROGRESSIVE_MAX_BLOCKS = 12
-FCN_DILATION_PROGRESSIVE_PATTERN = [1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4] # For up to 12 blocks
+FCN_DILATION_PROGRESSIVE_PATTERN = [1, 1, 1, 1, 2, 2, 2, 2, 4, 4, 4, 4]
 FCN_DILATION_CYCLIC_PATTERN = [1, 2, 4]
 
 # -------------------------------
@@ -56,8 +55,8 @@ OPT_STEPS_PER_CYCLE = 500
 # -------------------------------
 # Replay Buffer Parameters
 # -------------------------------
-REPLAY_BUFFER_CAPACITY = 4_000_000 # Adjusted, CHW might take more if not careful, though grid is uint8
-REPLAY_BUFFER_DIR = "replay_buffer_data_fcn" # New dir to avoid conflicts
+REPLAY_BUFFER_CAPACITY = 4_000_000
+REPLAY_BUFFER_DIR = "replay_buffer_data_fcn"
 
 # -------------------------------
 # Optuna / Trainer Parameters

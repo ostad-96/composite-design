@@ -1,4 +1,4 @@
-# utils/dqn.py
+# project_root/utils/dqn.py
 
 import numpy as np
 import os
@@ -10,6 +10,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import LinearLR
+from torch.nn.functional import smooth_l1_loss # <<< Added
+from torch.nn.utils import clip_grad_norm_ # <<< Added
 import time
 
 from utils.fem import voigt_model, reuss_model
@@ -20,7 +22,8 @@ from config import (
     FCN_INPUT_CHANNELS,
     # Defaults from config, Optuna will override many of these:
     FCN_NUM_FILTERS_RESBLOCK, FCN_NUM_RES_BLOCKS, FCN_KERNEL_SIZE,
-    REPLAY_BUFFER_CAPACITY, REPLAY_BUFFER_DIR
+    REPLAY_BUFFER_CAPACITY, REPLAY_BUFFER_DIR,
+    CLIP_GRAD_NORM_MAX # <<< Added import from config
 )
 
 # --- CompositeDesignEnv class remains the same as your latest version ---
@@ -95,14 +98,14 @@ class CompositeDesignEnv(gym.Env):
         return np.concatenate([grid_flat, scalar_metrics])
 
     def compute_reward(self, current_modulus, current_vol_frac, desired_modulus, desired_vol_frac, weight_E=1.0, weight_Vf=5.0): # Your reward
-        r_modulus = -abs(current_modulus - desired_modulus ) / self.max_modulus
+        r_modulus  = -abs(current_modulus  - desired_modulus ) / self.max_modulus
         r_vol_frac = -abs(current_vol_frac - desired_vol_frac)
         return (weight_E * r_modulus) + (weight_Vf * r_vol_frac)
 
     def _check_goal_met(self, current_modulus, current_vol_frac, desired_modulus, desired_vol_frac):
         """Checks if the current state meets the success criteria."""
-        modulus_tolerance = 50 # MPa
-        vf_tolerance = 0.04 # Absolute difference
+        modulus_tolerance = 50  # MPa
+        vf_tolerance = 0.04  # Absolute difference
         modulus_met = abs(current_modulus - desired_modulus) <= modulus_tolerance
         vf_met = abs(current_vol_frac - desired_vol_frac) <= vf_tolerance
         return bool(modulus_met and vf_met) # Explicitly return boolean
@@ -121,6 +124,7 @@ class CompositeDesignEnv(gym.Env):
             self.current_modulus, self.current_vol_frac,
             self.desired_modulus, self.desired_vol_frac
         )
+        
         info = {
             'current_modulus': self.current_modulus,
             'current_vol_frac': self.current_vol_frac,
@@ -162,15 +166,9 @@ class CompositeDesignEnv(gym.Env):
 class ResBlock(nn.Module):
     def __init__(self, num_filters: int, kernel_size: int = 3, dilation: int = 1):
         super(ResBlock, self).__init__()
-        # Calculate padding to keep feature map size same with dilation
-        # padding = dilation * (kernel_size - 1) // 2
-        # For a 3x3 kernel, padding = dilation. For a 5x5 kernel, padding = 2 * dilation.
-        if kernel_size % 2 == 0: # Basic check for odd kernel sizes
+        if kernel_size % 2 == 0:
             raise ValueError("ResBlock kernel_size must be odd to use standard padding formula.")
-        # Correct padding formula for 'same' output size with dilation & stride 1
-        # P = D * (K - 1) / 2
         padding = dilation * (kernel_size - 1) // 2
-
         self.conv = nn.Conv2d(num_filters, num_filters,
                               kernel_size=kernel_size,
                               padding=padding,
@@ -184,8 +182,8 @@ class ResBlock(nn.Module):
         out = self.conv(x)
         out = self.relu(out)
         out = self.bn(out)
-        out = out + identity # Residual skip
-        out = self.relu(out) # ReLU after skip
+        out = out + identity
+        out = self.relu(out)
         return out
 
 class PixelQNetwork(nn.Module):
@@ -194,32 +192,25 @@ class PixelQNetwork(nn.Module):
                  H: int = MATRIX_SIZE, W: int = MATRIX_SIZE,
                  num_filters_resblock: int = FCN_NUM_FILTERS_RESBLOCK,
                  num_res_blocks: int = FCN_NUM_RES_BLOCKS,
-                 kernel_size_resblock: int = FCN_KERNEL_SIZE, # Kernel size for all ResBlocks
-                 dilation_factors_per_block: list[int] | None = None): # List of dilations
+                 kernel_size_resblock: int = FCN_KERNEL_SIZE,
+                 dilation_factors_per_block: list[int] | None = None):
         super(PixelQNetwork, self).__init__()
-
         if dilation_factors_per_block is None:
-            # Default to all ones if no specific dilation factors are provided
             dilation_factors_per_block = [1] * num_res_blocks
         elif len(dilation_factors_per_block) != num_res_blocks:
             raise ValueError(f"Length of dilation_factors_per_block ({len(dilation_factors_per_block)}) "
                              f"must match num_res_blocks ({num_res_blocks}).")
-
-        # Initial convolution to bring input_channels to num_filters_resblock
         self.initial_processing = nn.Sequential(
             nn.Conv2d(input_channels, num_filters_resblock, kernel_size=3, padding=1, bias=False),
             nn.BatchNorm2d(num_filters_resblock),
             nn.ReLU(inplace=True)
         )
-
         res_layers = []
         for i in range(num_res_blocks):
             res_layers.append(ResBlock(num_filters=num_filters_resblock,
                                        kernel_size=kernel_size_resblock,
                                        dilation=dilation_factors_per_block[i]))
         self.res_blocks = nn.Sequential(*res_layers)
-
-        # Final 1x1 convolution to produce the Q-map (1 channel)
         self.final_conv = nn.Conv2d(num_filters_resblock, 1, kernel_size=1, bias=False)
 
     def forward(self, x):
@@ -230,20 +221,21 @@ class PixelQNetwork(nn.Module):
 
 class DQNAgent:
     def __init__( self, device: torch.device, *,
-                  matrix_size: int = MATRIX_SIZE,
-                  fcn_input_channels: int = FCN_INPUT_CHANNELS,
-                  num_scalar_metrics_env: int = 4,
-                  lr: float = LEARNING_RATE, gamma: float = GAMMA, batch_size: int = BATCH_SIZE,
-                  # FCN architecture HPs
-                  fcn_num_filters: int = FCN_NUM_FILTERS_RESBLOCK,
-                  fcn_blocks: int = FCN_NUM_RES_BLOCKS,
-                  fcn_kernel_size: int = FCN_KERNEL_SIZE, # Kernel size for ResBlocks
-                  fcn_dilation_factors: list[int], # List of dilations for ResBlocks
-                  epsilon_start: float = 1.0, epsilon_decay: float = EPSILON_DECAY,
-                  epsilon_min: float = EPSILON_MIN, tau: float = TAU,
-                  use_lr_scheduler: bool = True, lr_end_factor: float = 0.1, lr_decay_cycles: int = 100,
-                  buffer_capacity: int = REPLAY_BUFFER_CAPACITY, buffer_dir: str = REPLAY_BUFFER_DIR
-                 ):
+        matrix_size: int = MATRIX_SIZE,
+        fcn_input_channels: int = FCN_INPUT_CHANNELS,
+        num_scalar_metrics_env: int = 4,
+        lr: float = LEARNING_RATE, gamma: float = GAMMA, batch_size: int = BATCH_SIZE,
+        # FCN architecture HPs
+        fcn_num_filters: int = FCN_NUM_FILTERS_RESBLOCK,
+        fcn_blocks: int = FCN_NUM_RES_BLOCKS,
+        fcn_kernel_size: int = FCN_KERNEL_SIZE,
+        fcn_dilation_factors: list[int],
+        epsilon_start: float = 1.0, epsilon_decay: float = EPSILON_DECAY,
+        epsilon_min: float = EPSILON_MIN, tau: float = TAU,
+        use_lr_scheduler: bool = True, lr_end_factor: float = 0.1, lr_decay_cycles: int = 100,
+        buffer_capacity: int = REPLAY_BUFFER_CAPACITY, buffer_dir: str = REPLAY_BUFFER_DIR,
+        clip_grad_norm_max: float = CLIP_GRAD_NORM_MAX # <<< Added
+        ):
         self.device = device
         self.H = matrix_size; self.W = matrix_size
         self.fcn_input_C = fcn_input_channels
@@ -253,15 +245,15 @@ class DQNAgent:
         self.num_scalar_metrics_for_buffer = num_scalar_metrics_env
         self.flat_state_dim_for_buffer = self.flat_grid_dim_for_buffer + self.num_scalar_metrics_for_buffer
 
-        # Store all HPs for checkpointing and consistency
         self.lr, self.gamma, self.batch_size = lr, gamma, batch_size
         self.fcn_num_filters = fcn_num_filters
-        self.fcn_blocks = fcn_blocks # This is num_res_blocks
+        self.fcn_blocks = fcn_blocks
         self.fcn_kernel_size = fcn_kernel_size
-        self.fcn_dilation_factors = fcn_dilation_factors # List of dilations
+        self.fcn_dilation_factors = fcn_dilation_factors
         self.epsilon_start, self.epsilon_decay, self.epsilon_min, self.tau = epsilon_start, epsilon_decay, epsilon_min, tau
         self.use_lr_scheduler, self.lr_end_factor, self.lr_decay_cycles = use_lr_scheduler, lr_end_factor, lr_decay_cycles
         self.buffer_capacity, self.buffer_dir = buffer_capacity, buffer_dir
+        self.clip_grad_norm_max = clip_grad_norm_max # <<< Added
 
         if len(fcn_dilation_factors) != fcn_blocks:
             raise ValueError("Length of fcn_dilation_factors must match fcn_blocks (num_res_blocks).")
@@ -308,7 +300,7 @@ class DQNAgent:
         fcn_input = torch.cat([grid_tensor] + broadcasted_metric_channels, dim=1)
         return fcn_input.to(self.device)
 
-    def select_action(self, flat_state_from_env: np.ndarray) -> int: # Same as before
+    def select_action(self, flat_state_from_env: np.ndarray) -> int:
         if random.random() < self.epsilon:
             return random.randrange(self.action_dim)
         else:
@@ -318,21 +310,28 @@ class DQNAgent:
             self.main_net.train()
             return q_map.view(1, -1).argmax().item()
 
-    def update(self) -> float | None: # Same as before
+    def update(self) -> float | None:
         if len(self.replay_buffer) < self.batch_size: return None
         states_chw, actions, rewards, next_states_chw, dones = self.replay_buffer.sample(self.batch_size)
-        self.main_net.eval(); self.target_net.eval()
+        self.main_net.eval(); self.target_net.eval() # Set to eval for consistency with no_grad
         with torch.no_grad():
             next_q_maps_main = self.main_net(next_states_chw)
             next_actions_indices = next_q_maps_main.view(self.batch_size, -1).argmax(dim=1, keepdim=True)
             next_q_maps_target = self.target_net(next_states_chw)
             next_q_values = next_q_maps_target.view(self.batch_size, -1).gather(1, next_actions_indices)
             target_q = rewards + self.gamma * next_q_values * (1.0 - dones)
-        self.main_net.train()
+        
+        self.main_net.train() # Set back to train for gradient calculation
         current_q_maps_main = self.main_net(states_chw)
         current_q_for_actions = current_q_maps_main.view(self.batch_size, -1).gather(1, actions)
-        loss = nn.MSELoss()(current_q_for_actions, target_q)
-        self.optimizer.zero_grad(); loss.backward(); self.optimizer.step()
+        
+        loss = smooth_l1_loss(current_q_for_actions, target_q) # <<< Changed to smooth_l1_loss (Huber)
+        
+        self.optimizer.zero_grad()
+        loss.backward()
+        clip_grad_norm_(self.main_net.parameters(), self.clip_grad_norm_max) # <<< Added gradient clipping
+        self.optimizer.step()
+        
         return loss.item()
 
     def soft_update_target(self):
@@ -349,15 +348,16 @@ class DQNAgent:
             'num_scalar_metrics_env': self.num_scalar_metrics_for_buffer,
             'lr': self.lr, 'gamma': self.gamma, 'batch_size': self.batch_size,
             'fcn_num_filters': self.fcn_num_filters,
-            'fcn_blocks': self.fcn_blocks, # Num ResBlocks
-            'fcn_kernel_size': self.fcn_kernel_size, # Kernel size for ResBlocks
-            'fcn_dilation_factors': self.fcn_dilation_factors, # List of dilations
+            'fcn_blocks': self.fcn_blocks,
+            'fcn_kernel_size': self.fcn_kernel_size,
+            'fcn_dilation_factors': self.fcn_dilation_factors,
             'epsilon_start': self.epsilon_start, 'epsilon_decay': self.epsilon_decay,
             'epsilon_min': self.epsilon_min, 'tau': self.tau,
             'use_lr_scheduler': self.use_lr_scheduler, 'lr_end_factor': self.lr_end_factor,
             'lr_decay_cycles': self.lr_decay_cycles,
             'flat_state_dim_for_buffer': self.flat_state_dim_for_buffer,
             'action_dim': self.action_dim,
+            'clip_grad_norm_max': self.clip_grad_norm_max # <<< Added
         }
         agent_state = {
             'main_net_state_dict': self.main_net.state_dict(),
@@ -384,21 +384,47 @@ class DQNAgent:
         if self.fcn_input_C != loaded_agent_hps.get('fcn_input_channels'): mismatched_critical.append("fcn_input_channels")
         if self.fcn_blocks != loaded_agent_hps.get('fcn_blocks'): mismatched_critical.append("fcn_blocks")
         if self.fcn_kernel_size != loaded_agent_hps.get('fcn_kernel_size'): mismatched_critical.append("fcn_kernel_size")
-        # Compare lists for dilation factors
         if list(self.fcn_dilation_factors) != list(loaded_agent_hps.get('fcn_dilation_factors', [])):
              mismatched_critical.append("fcn_dilation_factors")
 
         if mismatched_critical:
             print("CRITICAL HP MISMATCHES PREVENTING LOAD:")
             for key in mismatched_critical:
-                print(f"  - {key}: Current='{getattr(self, key, 'N/A')}', Checkpoint='{loaded_agent_hps.get(key)}'")
+                current_val_str = f"'{getattr(self, key, 'N/A')}'"
+                chkpt_val_str = f"'{loaded_agent_hps.get(key)}'"
+                print(f"  - {key}: Current={current_val_str}, Checkpoint={chkpt_val_str}")
             raise ValueError(f"Critical architectural hyperparameter mismatch: {', '.join(mismatched_critical)}")
+        
+        # --- Non-critical HP update/check ---
+        # These won't prevent loading but will ensure the agent object reflects the loaded HPs if they differ
+        # For example, learning rate, epsilon parameters, tau, batch_size etc.
+        # And the new clip_grad_norm_max
+        non_critical_hps_to_update = [
+            'lr', 'gamma', 'batch_size', 'epsilon_start', 'epsilon_decay',
+            'epsilon_min', 'tau', 'use_lr_scheduler', 'lr_end_factor',
+            'lr_decay_cycles', 'clip_grad_norm_max' # <<< Added
+        ]
+        for hp_key in non_critical_hps_to_update:
+            loaded_val = loaded_agent_hps.get(hp_key)
+            current_val = getattr(self, hp_key, None)
+            if loaded_val is not None and loaded_val != current_val:
+                print(f"  Info: Updating HP '{hp_key}' from checkpoint: {current_val} -> {loaded_val}")
+                setattr(self, hp_key, loaded_val)
+        # Re-initialize optimizer and scheduler if relevant HPs changed (e.g. lr)
+        # This is a simple way; more robust would be to also load their states *after* param update
+        self.optimizer = optim.Adam(self.main_net.parameters(), lr=self.lr) # Re-init with potentially new lr
+        if self.use_lr_scheduler and self.lr_decay_cycles > 0:
+            self.lr_scheduler = LinearLR(self.optimizer, 1.0, self.lr_end_factor, self.lr_decay_cycles)
+
 
         if 'buffer_checkpoint_state' in agent_state:
             try:
                 self.replay_buffer.load_buffer_state_from_checkpoint(agent_state['buffer_checkpoint_state'])
             except ValueError as e: print(f"Error loading buffer state via agent: {e}"); raise
         else: print("Warning: No 'buffer_checkpoint_state' in agent state.")
+
+        if 'optimizer_state_dict' in agent_state: # Load optimizer state *after* re-init
+             self.optimizer.load_state_dict(agent_state['optimizer_state_dict'])
 
         if 'lr_scheduler_state_dict' in agent_state and self.lr_scheduler:
             try: self.lr_scheduler.load_state_dict(agent_state['lr_scheduler_state_dict'])
