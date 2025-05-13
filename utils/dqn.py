@@ -119,11 +119,14 @@ class CompositeDesignEnv(gym.Env):
         self.current_modulus = (voigt_model(self.current_vol_frac) + reuss_model(self.current_vol_frac)) / 2
         reward = self.compute_reward(self.current_modulus, self.current_vol_frac,
                                      self.desired_modulus, self.desired_vol_frac)
-        done = (self.current_step >= self.max_steps)
+        
         goal_met_this_step = self._check_goal_met(
             self.current_modulus, self.current_vol_frac,
             self.desired_modulus, self.desired_vol_frac
         )
+        
+        # done = (self.current_step >= self.max_steps)
+        done = goal_met_this_step or (self.current_step >= self.max_steps)
         
         info = {
             'current_modulus': self.current_modulus,
