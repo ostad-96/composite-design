@@ -13,15 +13,15 @@ from torch.nn.functional import smooth_l1_loss, mse_loss # <<< Added mse_loss
 from torch.nn.utils import clip_grad_norm_
 
 import time
-from utils.fem import voigt_model, reuss_model
+from utils.fem import voigt_model, reuss_model, evaluate_composite
 from utils.replay_buffer import ReplayBuffer
 from config import (
-    MATRIX_SIZE, MAX_STEPS, LEARNING_RATE, BATCH_SIZE, GAMMA,
-    EPSILON_DECAY, EPSILON_MIN, TAU, E_STIFF, E_COMP,
+    MATRIX_SIZE, MAX_STEPS, OPTUNA_DEFAULT_LEARNING_RATE, OPTUNA_DEFAULT_BATCH_SIZE, OPTUNA_DEFAULT_GAMMA,
+    OPTUNA_DEFAULT_EPSILON_DECAY, OPTUNA_DEFAULT_EPSILON_MIN, OPTUNA_DEFAULT_TAU, E_STIFF, E_COMP,
     FCN_INPUT_CHANNELS,
-    FCN_NUM_FILTERS_RESBLOCK, FCN_NUM_RES_BLOCKS, FCN_KERNEL_SIZE,
-    REPLAY_BUFFER_CAPACITY, REPLAY_BUFFER_DIR,
-    CLIP_GRAD_NORM_MAX
+    OPTUNA_DEFAULT_FCN_NUM_FILTERS_RESBLOCK, OPTUNA_DEFAULT_FCN_NUM_RES_BLOCKS, OPTUNA_DEFAULT_FCN_KERNEL_SIZE,
+    OPTUNA_DEFAULT_REPLAY_BUFFER_CAPACITY, OPTUNA_REPLAY_BUFFER_DIR_BASE,
+    OPTUNA_DEFAULT_CLIP_GRAD_NORM_MAX
 )
 
 
@@ -65,7 +65,8 @@ class CompositeDesignEnv(gym.Env):
         self.grid = self.np_random.integers(0, 2, size=(self.grid_H, self.grid_W))
         self.current_step = 0
         self.current_vol_frac = (self.num_cells - np.sum(self.grid)) / self.num_cells
-        self.current_modulus = (voigt_model(self.current_vol_frac) + reuss_model(self.current_vol_frac)) / 2
+        # self.current_modulus = (voigt_model(self.current_vol_frac) + reuss_model(self.current_vol_frac)) / 2
+        self.current_modulus = evaluate_composite(self.grid)
         min_modulus_diff = 100
         while True:
             phi_goal = self.np_random.uniform(0.05, 0.95)
@@ -112,7 +113,9 @@ class CompositeDesignEnv(gym.Env):
         row, col = action // self.grid_W, action % self.grid_W
         self.grid[row, col] = 1 - self.grid[row, col]
         self.current_vol_frac = (self.num_cells - np.sum(self.grid)) / self.num_cells
-        self.current_modulus = (voigt_model(self.current_vol_frac) + reuss_model(self.current_vol_frac)) / 2
+        # self.current_modulus = (voigt_model(self.current_vol_frac) + reuss_model(self.current_vol_frac)) / 2
+        self.current_modulus = evaluate_composite(self.grid)
+        # print(self.current_modulus)
         reward = self.compute_reward(self.current_modulus, self.current_vol_frac, self.desired_modulus, self.desired_vol_frac)
         done = (self.current_step >= self.max_steps)
         goal_met_this_step = self._check_goal_met(
@@ -183,8 +186,8 @@ class ResBlock(nn.Module):
 
 class PixelQNetwork(nn.Module):
     def __init__(self, input_channels: int = FCN_INPUT_CHANNELS, H: int = MATRIX_SIZE, W: int = MATRIX_SIZE,
-                 num_filters_resblock: int = FCN_NUM_FILTERS_RESBLOCK, num_res_blocks: int = FCN_NUM_RES_BLOCKS,
-                 kernel_size_resblock: int = FCN_KERNEL_SIZE, dilation_factors_per_block: list[int] | None = None):
+                 num_filters_resblock: int = OPTUNA_DEFAULT_FCN_NUM_FILTERS_RESBLOCK, num_res_blocks: int = OPTUNA_DEFAULT_FCN_NUM_RES_BLOCKS,
+                 kernel_size_resblock: int = OPTUNA_DEFAULT_FCN_KERNEL_SIZE, dilation_factors_per_block: list[int] | None = None):
         super(PixelQNetwork, self).__init__()
         if dilation_factors_per_block is None:
             dilation_factors_per_block = [1] * num_res_blocks
@@ -219,24 +222,24 @@ class DQNAgent:
             matrix_size: int = MATRIX_SIZE,
             fcn_input_channels: int = FCN_INPUT_CHANNELS,
             num_scalar_metrics_env: int = 4,
-            lr: float = LEARNING_RATE,
-            gamma: float = GAMMA,
-            batch_size: int = BATCH_SIZE,
+            lr: float = OPTUNA_DEFAULT_LEARNING_RATE,
+            gamma: float = OPTUNA_DEFAULT_GAMMA,
+            batch_size: int = OPTUNA_DEFAULT_BATCH_SIZE,
             # FCN architecture HPs
-            fcn_num_filters: int = FCN_NUM_FILTERS_RESBLOCK,
-            fcn_blocks: int = FCN_NUM_RES_BLOCKS,
-            fcn_kernel_size: int = FCN_KERNEL_SIZE,
+            fcn_num_filters: int = OPTUNA_DEFAULT_FCN_NUM_FILTERS_RESBLOCK,
+            fcn_blocks: int = OPTUNA_DEFAULT_FCN_NUM_RES_BLOCKS,
+            fcn_kernel_size: int = OPTUNA_DEFAULT_FCN_KERNEL_SIZE,
             fcn_dilation_factors: list[int],
             epsilon_start: float = 1.0,
-            epsilon_decay: float = EPSILON_DECAY,
-            epsilon_min: float = EPSILON_MIN,
-            tau: float = TAU,
+            epsilon_decay: float = OPTUNA_DEFAULT_EPSILON_DECAY,
+            epsilon_min: float = OPTUNA_DEFAULT_EPSILON_MIN,
+            tau: float = OPTUNA_DEFAULT_TAU,
             use_lr_scheduler: bool = True,
             lr_end_factor: float = 0.1,
             lr_decay_cycles: int = 100,
-            buffer_capacity: int = REPLAY_BUFFER_CAPACITY,
-            buffer_dir: str = REPLAY_BUFFER_DIR,
-            clip_grad_norm_max: float = CLIP_GRAD_NORM_MAX,
+            buffer_capacity: int = OPTUNA_DEFAULT_REPLAY_BUFFER_CAPACITY,
+            buffer_dir: str = OPTUNA_REPLAY_BUFFER_DIR_BASE,
+            clip_grad_norm_max: float = OPTUNA_DEFAULT_CLIP_GRAD_NORM_MAX,
             loss_function_name: str = "smooth_l1"  # <<< Added new parameter with default
     ):
         self.device = device
@@ -290,8 +293,9 @@ class DQNAgent:
             flat_state_dim=self.flat_state_dim_for_buffer, H=self.H, W=self.W,
             num_scalar_metrics=self.num_scalar_metrics_for_buffer,
             fcn_output_channels_from_buffer=self.fcn_input_C,
-            capacity=buffer_capacity, directory=buffer_dir, device=device,
-            pin_memory=(device.type == 'cuda')
+            capacity=buffer_capacity, directory=buffer_dir,
+            device=device,  # This is agent.device (training device)
+            pin_memory=(device.type == 'cuda') # This correctly controls RAM tensor pinning
         )
         self.epsilon = epsilon_start
 

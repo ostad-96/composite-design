@@ -11,7 +11,7 @@ import time
 
 from utils.dqn import CompositeDesignEnv, DQNAgent # Assumes FCN versions
 from config import (
-    EPISODES_PER_CYCLE, OPT_STEPS_PER_CYCLE, NUM_CYCLES # Defaults
+    OPTUNA_DEFAULT_EPISODES_PER_CYCLE, OPTUNA_DEFAULT_OPT_STEPS_PER_CYCLE # Defaults
 )
 # Assuming CompositeDesignEnv has _check_goal_met method
 from utils.fem import voigt_model, reuss_model # Needed for HER
@@ -37,9 +37,9 @@ class Trainer:
         trial_number: int,
         *,
         # Loop parameters
-        episodes_per_cycle: int = EPISODES_PER_CYCLE,
-        opt_steps_per_cycle: int = OPT_STEPS_PER_CYCLE,
-        num_cycles: int = NUM_CYCLES, # Total cycles target for this specific run
+        episodes_per_cycle: int = None,
+        opt_steps_per_cycle: int = None,
+        num_cycles: int = None, # Total cycles target for this specific run
         # Checkpointing
         checkpoint_dir: str = "checkpoints",
         # Resumption state
