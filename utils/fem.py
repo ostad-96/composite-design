@@ -20,7 +20,7 @@ from config import MATRIX_SIZE, E_STIFF, NU_STIFF , E_COMP, NU_COMP
 # Global parameters – edit here first
 # -------------------------------------------------------------------------
 
-SUBDIVISIONS        = 8           # mesh cells per design pixel, per edge
+SUBDIVISIONS        = 1           # mesh cells per design pixel, per edge
 BLOCK_SIZE          = 5.0         # mm – physical edge length of one pixel
 PLANE_STRAIN        = False       # True → plane-strain, False → plane-stress
 DISPLACEMENT_RATIO  = 1e-3        # applied ε = DISPLACEMENT_RATIO

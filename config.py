@@ -21,14 +21,14 @@ NU_COMP = 0.49
 # -------------------------------
 # Target Material properties (Examples, environment often resets these dynamically)
 # -------------------------------
-DESIRED_MODULUS = 1302.17
-DESIRED_VOL_FRAC = 0.20
+DESIRED_MODULUS = 1302.17 # Example, will be overridden
+DESIRED_VOL_FRAC = 0.20   # Example, will be overridden
 
 # -------------------------------
 # Q-Network architecture (Common base parameters)
 # -------------------------------
-# FCN_INPUT_CHANNELS is typically fixed based on environment state representation
-FCN_INPUT_CHANNELS = 4 # 1 (grid) + 3 (broadcasted: current_VF, scaled_step, scaled_dist_E)
+# FCN_INPUT_CHANNELS: 1 (grid) + 4 (broadcasted: current_VF, target_VF, current_E_scaled, target_E_scaled)
+FCN_INPUT_CHANNELS = 5
 
 # Dilation strategy definitions (used by Optuna and potentially single runs if generating)
 FCN_DILATION_STRATEGIES = ["all_ones", "progressive_trim", "cyclic_124"]

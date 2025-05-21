@@ -9,23 +9,22 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import LinearLR
-from torch.nn.functional import smooth_l1_loss, mse_loss # <<< Added mse_loss
+from torch.nn.functional import smooth_l1_loss, mse_loss
 from torch.nn.utils import clip_grad_norm_
 
 import time
 from utils.fem import voigt_model, reuss_model, evaluate_composite
-from utils.replay_buffer import ReplayBuffer
+from utils.replay_buffer import ReplayBuffer # ReplayBuffer will also be updated
 from config import (
     MATRIX_SIZE, MAX_STEPS, OPTUNA_DEFAULT_LEARNING_RATE, OPTUNA_DEFAULT_BATCH_SIZE, OPTUNA_DEFAULT_GAMMA,
     OPTUNA_DEFAULT_EPSILON_DECAY, OPTUNA_DEFAULT_EPSILON_MIN, OPTUNA_DEFAULT_TAU, E_STIFF, E_COMP,
-    FCN_INPUT_CHANNELS,
+    FCN_INPUT_CHANNELS, # This is now 5
     OPTUNA_DEFAULT_FCN_NUM_FILTERS_RESBLOCK, OPTUNA_DEFAULT_FCN_NUM_RES_BLOCKS, OPTUNA_DEFAULT_FCN_KERNEL_SIZE,
     OPTUNA_DEFAULT_REPLAY_BUFFER_CAPACITY, OPTUNA_REPLAY_BUFFER_DIR_BASE,
     OPTUNA_DEFAULT_CLIP_GRAD_NORM_MAX
 )
 
 
-# --- CompositeDesignEnv class remains the same ---
 class CompositeDesignEnv(gym.Env):
     metadata = {'render.modes': ['human', 'rgb_array']}
     def __init__(self):
@@ -34,19 +33,30 @@ class CompositeDesignEnv(gym.Env):
         self.grid_W = MATRIX_SIZE
         self.num_cells = self.grid_H * self.grid_W
         self.max_steps = MAX_STEPS
-        self.max_modulus = max(E_STIFF, E_COMP)
-        self.num_scalar_metrics = 4 # VF, step_scaled, distE_scaled, target_VF
+        self.max_modulus = max(E_STIFF, E_COMP) # Used for scaling E values
+
+        # Define the scalar metrics:
+        # 0: current_VF
+        # 1: target_VF
+        # 2: current_E_scaled (current_modulus / max_modulus)
+        # 3: target_E_scaled (desired_modulus / max_modulus)
+        # 4: scaled_step (current_step / max_steps)
+        self.num_scalar_metrics = 5
+        self.metric_names = ["current_VF", "target_VF", "current_E_scaled", "target_E_scaled", "scaled_step"] # For clarity
+
         self.desired_modulus = None
         self.desired_vol_frac = None
         self.action_space = spaces.Discrete(self.num_cells)
+        
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0,
+            low=-1.0, high=1.0, # Kept general; actual values are mostly [0,1] for current setup
             shape=(self.num_cells + self.num_scalar_metrics,),
             dtype=np.float32
         )
+
         self.grid = None
         self.current_step = 0
-        self.current_modulus = None
+        self.current_modulus = None # Can be NaN if FEM fails
         self.current_vol_frac = None
         self.plot_save_dir = "composite_designs_fcn"
         os.makedirs(self.plot_save_dir, exist_ok=True)
@@ -65,44 +75,79 @@ class CompositeDesignEnv(gym.Env):
         self.grid = self.np_random.integers(0, 2, size=(self.grid_H, self.grid_W))
         self.current_step = 0
         self.current_vol_frac = (self.num_cells - np.sum(self.grid)) / self.num_cells
-        # self.current_modulus = (voigt_model(self.current_vol_frac) + reuss_model(self.current_vol_frac)) / 2
         self.current_modulus = evaluate_composite(self.grid)
-        min_modulus_diff = 100
+        # self.current_modulus = (voigt_model(self.current_vol_frac) + reuss_model(self.current_vol_frac)) / 2
+        if np.isnan(self.current_modulus):
+            # print("Warning: FEM failed during env.reset(), setting current_modulus to a fallback (e.g., E_COMP).")
+            self.current_modulus = E_COMP 
+
+        min_modulus_diff = 100 # Try to ensure initial state is not too close to target
+        attempts = 0
         while True:
+            attempts +=1
             phi_goal = self.np_random.uniform(0.05, 0.95)
             E_voigt_goal = voigt_model(phi_goal)
             E_reuss_goal = reuss_model(phi_goal)
-            if np.isnan(E_reuss_goal):
-                E_reuss_goal = E_voigt_goal
-            desired_modulus = (E_voigt_goal + E_reuss_goal) / 2
-            if abs(self.current_modulus - desired_modulus) >= min_modulus_diff:
+            if np.isnan(E_reuss_goal): E_reuss_goal = E_voigt_goal
+            
+            desired_modulus_candidate = (E_voigt_goal + E_reuss_goal) / 2.0
+            if np.isnan(desired_modulus_candidate): desired_modulus_candidate = E_voigt_goal
+
+            current_mod_safe = self.current_modulus if not np.isnan(self.current_modulus) else E_COMP
+            if abs(current_mod_safe - desired_modulus_candidate) >= min_modulus_diff:
+                self.desired_modulus = desired_modulus_candidate
+                self.desired_vol_frac = phi_goal
                 break
-        self.desired_modulus = desired_modulus
-        self.desired_vol_frac = phi_goal
+            if attempts > 100: 
+                # print("Warning: Could not find suitable initial desired_modulus after 100 attempts. Using last candidate.")
+                self.desired_modulus = desired_modulus_candidate
+                self.desired_vol_frac = phi_goal
+                break
         return self._get_flat_state()
 
     def _get_flat_state(self):
         grid_flat = self.grid.flatten().astype(np.float32)
+
         current_vf_metric = self.current_vol_frac
-        scaled_step_metric = self.current_step / self.max_steps if self.max_steps > 0 else 0.0
-        dist_e = self.current_modulus - self.desired_modulus
-        scaled_dist_e_metric = np.clip(dist_e / self.max_modulus if self.max_modulus > 0 else 0.0, -1.0, 1.0)
         target_vf_metric = self.desired_vol_frac
+        
+        current_modulus_safe = self.current_modulus if not np.isnan(self.current_modulus) else 0.0 
+        
+        current_e_scaled_metric = np.clip(current_modulus_safe / self.max_modulus if self.max_modulus > 0 else 0.0, 0.0, 1.0)
+        target_e_scaled_metric = np.clip(self.desired_modulus / self.max_modulus if self.max_modulus > 0 else 0.0, 0.0, 1.0)
+        
+        scaled_step_metric = self.current_step / self.max_steps if self.max_steps > 0 else 0.0
+
         scalar_metrics = np.array([
-            current_vf_metric, scaled_step_metric,
-            scaled_dist_e_metric, target_vf_metric
+            current_vf_metric,
+            target_vf_metric,
+            current_e_scaled_metric,
+            target_e_scaled_metric,
+            scaled_step_metric
         ], dtype=np.float32)
+
+        if scalar_metrics.shape[0] != self.num_scalar_metrics:
+            raise RuntimeError(f"Mismatch in num_scalar_metrics: expected {self.num_scalar_metrics}, got {scalar_metrics.shape[0]}")
+
         return np.concatenate([grid_flat, scalar_metrics])
 
-    def compute_reward(self, current_modulus, current_vol_frac, desired_modulus, desired_vol_frac, weight_E=1.0, weight_Vf=5.0):
-        r_modulus = -abs(current_modulus - desired_modulus ) / self.max_modulus
-        r_vol_frac = -abs(current_vol_frac - desired_vol_frac)
-        return (weight_E * r_modulus) + (weight_Vf * r_vol_frac)
+    def compute_reward(self, current_modulus, current_vol_frac, desired_modulus, desired_vol_frac, weight_E=5.0, weight_Vf=1.0):
+        current_modulus_safe = current_modulus if not np.isnan(current_modulus) else 0.0
+
+        
+        if self._check_goal_met(current_modulus, current_vol_frac, desired_modulus, desired_vol_frac):
+            return 1
+        else:
+            r_modulus = -abs(current_modulus_safe - desired_modulus ) / self.max_modulus
+            r_vol_frac = -abs(current_vol_frac - desired_vol_frac)
+            return (weight_E * r_modulus) + (weight_Vf * r_vol_frac)
 
     def _check_goal_met(self, current_modulus, current_vol_frac, desired_modulus, desired_vol_frac):
-        modulus_tolerance = 50
-        vf_tolerance = 0.04
-        modulus_met = abs(current_modulus - desired_modulus) <= modulus_tolerance
+        current_modulus_safe = current_modulus if not np.isnan(current_modulus) else -float('inf')
+
+        modulus_tolerance = 50 
+        vf_tolerance = 0.04 
+        modulus_met = abs(current_modulus_safe - desired_modulus) <= modulus_tolerance
         vf_met = abs(current_vol_frac - desired_vol_frac) <= vf_tolerance
         return bool(modulus_met and vf_met)
 
@@ -111,11 +156,12 @@ class CompositeDesignEnv(gym.Env):
             raise ValueError(f"Invalid action: {action}")
         self.current_step += 1
         row, col = action // self.grid_W, action % self.grid_W
-        self.grid[row, col] = 1 - self.grid[row, col]
+        self.grid[row, col] = 1 - self.grid[row, col] 
         self.current_vol_frac = (self.num_cells - np.sum(self.grid)) / self.num_cells
-        # self.current_modulus = (voigt_model(self.current_vol_frac) + reuss_model(self.current_vol_frac)) / 2
+        
         self.current_modulus = evaluate_composite(self.grid)
-        # print(self.current_modulus)
+        # self.current_modulus = (voigt_model(self.current_vol_frac) + reuss_model(self.current_vol_frac)) / 2
+
         reward = self.compute_reward(self.current_modulus, self.current_vol_frac, self.desired_modulus, self.desired_vol_frac)
         done = (self.current_step >= self.max_steps)
         goal_met_this_step = self._check_goal_met(
@@ -123,14 +169,14 @@ class CompositeDesignEnv(gym.Env):
             self.desired_modulus, self.desired_vol_frac
         )
         info = {
-            'current_modulus': self.current_modulus,
+            'current_modulus': self.current_modulus if not np.isnan(self.current_modulus) else "NaN",
             'current_vol_frac': self.current_vol_frac,
             'target_modulus': self.desired_modulus,
             'target_vol_frac': self.desired_vol_frac,
             'goal_met': goal_met_this_step
         }
         return self._get_flat_state(), reward, done, info
-
+    
     def render(self, mode='human'):
         design_tuple = tuple(self.grid.flatten())
         if design_tuple in self.saved_designs_in_episode and mode !='rgb_array':
@@ -138,8 +184,9 @@ class CompositeDesignEnv(gym.Env):
         self.saved_designs_in_episode.add(design_tuple)
         fig, ax = plt.subplots()
         ax.imshow(self.grid, cmap='gray', vmin=0, vmax=1)
+        current_mod_display = f"{self.current_modulus:.0f}" if not np.isnan(self.current_modulus) else "NaN"
         title_str = (
-            f"S:{self.current_step} E:{self.current_modulus:.0f} VF:{self.current_vol_frac:.2f}\n"
+            f"S:{self.current_step} E:{current_mod_display} VF:{self.current_vol_frac:.2f}\n"
             f"Tg E:{self.desired_modulus:.0f} VF:{self.desired_vol_frac:.2f}"
         )
         ax.set_title(title_str, fontsize=9)
@@ -220,12 +267,11 @@ class DQNAgent:
             device: torch.device,
             *,
             matrix_size: int = MATRIX_SIZE,
-            fcn_input_channels: int = FCN_INPUT_CHANNELS,
-            num_scalar_metrics_env: int = 4,
+            fcn_input_channels: int = FCN_INPUT_CHANNELS, # Will be 5 from config
+            num_scalar_metrics_env: int, # Must be passed from env.num_scalar_metrics (now 5)
             lr: float = OPTUNA_DEFAULT_LEARNING_RATE,
             gamma: float = OPTUNA_DEFAULT_GAMMA,
             batch_size: int = OPTUNA_DEFAULT_BATCH_SIZE,
-            # FCN architecture HPs
             fcn_num_filters: int = OPTUNA_DEFAULT_FCN_NUM_FILTERS_RESBLOCK,
             fcn_blocks: int = OPTUNA_DEFAULT_FCN_NUM_RES_BLOCKS,
             fcn_kernel_size: int = OPTUNA_DEFAULT_FCN_KERNEL_SIZE,
@@ -240,36 +286,31 @@ class DQNAgent:
             buffer_capacity: int = OPTUNA_DEFAULT_REPLAY_BUFFER_CAPACITY,
             buffer_dir: str = OPTUNA_REPLAY_BUFFER_DIR_BASE,
             clip_grad_norm_max: float = OPTUNA_DEFAULT_CLIP_GRAD_NORM_MAX,
-            loss_function_name: str = "smooth_l1"  # <<< Added new parameter with default
+            loss_function_name: str = "smooth_l1"
     ):
         self.device = device
         self.H = matrix_size; self.W = matrix_size
-        self.fcn_input_C = fcn_input_channels
+        self.fcn_input_C = fcn_input_channels 
         self.action_dim = self.H * self.W
         self.flat_grid_dim_for_buffer = self.H * self.W
         self.num_scalar_metrics_for_buffer = num_scalar_metrics_env
         self.flat_state_dim_for_buffer = self.flat_grid_dim_for_buffer + self.num_scalar_metrics_for_buffer
 
         self.lr, self.gamma, self.batch_size = lr, gamma, batch_size
-        self.fcn_num_filters = fcn_num_filters
-        self.fcn_blocks = fcn_blocks
-        self.fcn_kernel_size = fcn_kernel_size
+        self.fcn_num_filters, self.fcn_blocks, self.fcn_kernel_size = fcn_num_filters, fcn_blocks, fcn_kernel_size
         self.fcn_dilation_factors = fcn_dilation_factors
         self.epsilon_start, self.epsilon_decay, self.epsilon_min, self.tau = epsilon_start, epsilon_decay, epsilon_min, tau
         self.use_lr_scheduler, self.lr_end_factor, self.lr_decay_cycles = use_lr_scheduler, lr_end_factor, lr_decay_cycles
         self.buffer_capacity, self.buffer_dir = buffer_capacity, buffer_dir
         self.clip_grad_norm_max = clip_grad_norm_max
-        self.loss_function_name = loss_function_name # <<< Store loss function name
+        self.loss_function_name = loss_function_name
 
-        if self.loss_function_name == "smooth_l1":
-            self.loss_fn = smooth_l1_loss
-        elif self.loss_function_name == "mse":
-            self.loss_fn = mse_loss
-        else:
-            raise ValueError(f"Unsupported loss_function_name: {self.loss_function_name}. Choose 'smooth_l1' or 'mse'.")
+        if self.loss_function_name == "smooth_l1": self.loss_fn = smooth_l1_loss
+        elif self.loss_function_name == "mse": self.loss_fn = mse_loss
+        else: raise ValueError(f"Unsupported loss_function_name: {self.loss_function_name}.")
 
         if len(fcn_dilation_factors) != fcn_blocks:
-            raise ValueError("Length of fcn_dilation_factors must match fcn_blocks (num_res_blocks).")
+            raise ValueError("Length of fcn_dilation_factors must match fcn_blocks.")
 
         self.main_net = PixelQNetwork(
             input_channels=self.fcn_input_C, H=self.H, W=self.W,
@@ -291,22 +332,31 @@ class DQNAgent:
         os.makedirs(buffer_dir, exist_ok=True)
         self.replay_buffer = ReplayBuffer(
             flat_state_dim=self.flat_state_dim_for_buffer, H=self.H, W=self.W,
-            num_scalar_metrics=self.num_scalar_metrics_for_buffer,
-            fcn_output_channels_from_buffer=self.fcn_input_C,
+            num_scalar_metrics=self.num_scalar_metrics_for_buffer, # This is total env scalar metrics (5)
+            fcn_output_channels_from_buffer=self.fcn_input_C,      # This is FCN input channels (5)
             capacity=buffer_capacity, directory=buffer_dir,
-            device=device,  # This is agent.device (training device)
-            pin_memory=(device.type == 'cuda') # This correctly controls RAM tensor pinning
+            device=device, pin_memory=(device.type == 'cuda')
         )
         self.epsilon = epsilon_start
 
     def _convert_flat_single_state_to_fcn_input(self, flat_state_numpy: np.ndarray) -> torch.Tensor:
         grid_flat = flat_state_numpy[:self.flat_grid_dim_for_buffer]
-        metrics_scalar = flat_state_numpy[self.flat_grid_dim_for_buffer:]
+        metrics_scalar_all = flat_state_numpy[self.flat_grid_dim_for_buffer:] 
+
         grid_tensor = torch.from_numpy(grid_flat.astype(np.float32)).view(1, 1, self.H, self.W)
         broadcasted_metric_channels = []
-        for metric_idx in ReplayBuffer.METRIC_INDICES_FOR_FCN_CHANNELS:
-            scalar_val = torch.tensor(metrics_scalar[metric_idx], dtype=torch.float32).view(1,1,1,1)
+        
+        # ReplayBuffer.METRIC_INDICES_FOR_FCN_CHANNELS defines which of the stored scalar metrics
+        # are used for broadcasting. This should be [0, 1, 2, 3] for the 4 desired metrics.
+        for metric_idx_in_env_state in ReplayBuffer.METRIC_INDICES_FOR_FCN_CHANNELS:
+            if metric_idx_in_env_state >= len(metrics_scalar_all):
+                raise IndexError(f"FCN metric index {metric_idx_in_env_state} OOB for env scalar metrics (count: {len(metrics_scalar_all)}). Check ReplayBuffer.METRIC_INDICES_FOR_FCN_CHANNELS.")
+            scalar_val = torch.tensor(metrics_scalar_all[metric_idx_in_env_state], dtype=torch.float32).view(1,1,1,1)
             broadcasted_metric_channels.append(scalar_val.expand(1, 1, self.H, self.W))
+        
+        if len(broadcasted_metric_channels) != (self.fcn_input_C - 1):
+             raise ValueError(f"Incorrect number of broadcasted metric channels prepared. Expected {self.fcn_input_C - 1}, got {len(broadcasted_metric_channels)}")
+
         fcn_input = torch.cat([grid_tensor] + broadcasted_metric_channels, dim=1)
         return fcn_input.to(self.device)
 
@@ -339,7 +389,7 @@ class DQNAgent:
         current_q_maps_main = self.main_net(states_chw)
         current_q_for_actions = current_q_maps_main.view(self.batch_size, -1).gather(1, actions)
 
-        loss = self.loss_fn(current_q_for_actions, target_q) # <<< Use selected loss_fn
+        loss = self.loss_fn(current_q_for_actions, target_q) 
 
         self.optimizer.zero_grad()
         loss.backward()
@@ -358,26 +408,16 @@ class DQNAgent:
         buffer_chkpt_state = self.replay_buffer.get_buffer_state_for_checkpoint()
         agent_specific_hps = {
             'matrix_size': self.H,
-            'fcn_input_channels': self.fcn_input_C,
-            'num_scalar_metrics_env': self.num_scalar_metrics_for_buffer,
-            'lr': self.lr,
-            'gamma': self.gamma,
-            'batch_size': self.batch_size,
-            'fcn_num_filters': self.fcn_num_filters,
-            'fcn_blocks': self.fcn_blocks,
-            'fcn_kernel_size': self.fcn_kernel_size,
+            'fcn_input_channels': self.fcn_input_C, # Will be 5
+            'num_scalar_metrics_env': self.num_scalar_metrics_for_buffer, # Will be 5
+            'lr': self.lr, 'gamma': self.gamma, 'batch_size': self.batch_size,
+            'fcn_num_filters': self.fcn_num_filters, 'fcn_blocks': self.fcn_blocks, 'fcn_kernel_size': self.fcn_kernel_size,
             'fcn_dilation_factors': self.fcn_dilation_factors,
-            'epsilon_start': self.epsilon_start,
-            'epsilon_decay': self.epsilon_decay,
-            'epsilon_min': self.epsilon_min,
-            'tau': self.tau,
-            'use_lr_scheduler': self.use_lr_scheduler,
-            'lr_end_factor': self.lr_end_factor,
-            'lr_decay_cycles': self.lr_decay_cycles,
-            'flat_state_dim_for_buffer': self.flat_state_dim_for_buffer,
-            'action_dim': self.action_dim,
-            'clip_grad_norm_max': self.clip_grad_norm_max,
-            'loss_function_name': self.loss_function_name # <<< Add to state
+            'epsilon_start': self.epsilon_start, 'epsilon_decay': self.epsilon_decay, 'epsilon_min': self.epsilon_min,
+            'tau': self.tau, 'use_lr_scheduler': self.use_lr_scheduler, 'lr_end_factor': self.lr_end_factor,
+            'lr_decay_cycles': self.lr_decay_cycles, 'flat_state_dim_for_buffer': self.flat_state_dim_for_buffer,
+            'action_dim': self.action_dim, 'clip_grad_norm_max': self.clip_grad_norm_max,
+            'loss_function_name': self.loss_function_name
         }
         agent_state = {
             'main_net_state_dict': self.main_net.state_dict(),
@@ -395,36 +435,28 @@ class DQNAgent:
         print("Loading agent state from FCN checkpoint...")
         self.main_net.load_state_dict(agent_state['main_net_state_dict'])
         self.target_net.load_state_dict(agent_state['target_net_state_dict'])
-        # Optimizer state is loaded later after potential HP updates
         self.epsilon = agent_state['epsilon']
         loaded_agent_hps = agent_state.get('agent_hyperparameters', {})
 
-        # --- Critical Architectural HP Checks ---
         mismatched_critical = []
         if self.H != loaded_agent_hps.get('matrix_size'): mismatched_critical.append("matrix_size")
         if self.fcn_input_C != loaded_agent_hps.get('fcn_input_channels'): mismatched_critical.append("fcn_input_channels")
+        if self.num_scalar_metrics_for_buffer != loaded_agent_hps.get('num_scalar_metrics_env'): mismatched_critical.append("num_scalar_metrics_env")
         if self.fcn_blocks != loaded_agent_hps.get('fcn_blocks'): mismatched_critical.append("fcn_blocks")
         if self.fcn_kernel_size != loaded_agent_hps.get('fcn_kernel_size'): mismatched_critical.append("fcn_kernel_size")
         if list(self.fcn_dilation_factors) != list(loaded_agent_hps.get('fcn_dilation_factors', [])): mismatched_critical.append("fcn_dilation_factors")
-        # Consider loss_function_name critical? If changed, optimizer was trained with different objective.
-        # For now, let's treat it as non-critical that gets updated.
-        # If desired to be critical, add:
-        # if self.loss_function_name != loaded_agent_hps.get('loss_function_name'): mismatched_critical.append("loss_function_name")
-
 
         if mismatched_critical:
             print("CRITICAL HP MISMATCHES PREVENTING LOAD:")
             for key in mismatched_critical:
-                current_val_str = f"'{getattr(self, key, 'N/A')}'"
-                chkpt_val_str = f"'{loaded_agent_hps.get(key)}'"
+                current_val_str = f"'{getattr(self, key, 'N/A')}'"; chkpt_val_str = f"'{loaded_agent_hps.get(key)}'"
                 print(f" - {key}: Current={current_val_str}, Checkpoint={chkpt_val_str}")
-            raise ValueError(f"Critical architectural hyperparameter mismatch: {', '.join(mismatched_critical)}")
+            raise ValueError(f"Critical architectural/state hyperparameter mismatch: {', '.join(mismatched_critical)}")
 
-        # --- Non-critical HP update/check ---
         non_critical_hps_to_update = [
             'lr', 'gamma', 'batch_size', 'epsilon_start', 'epsilon_decay',
             'epsilon_min', 'tau', 'use_lr_scheduler', 'lr_end_factor',
-            'lr_decay_cycles', 'clip_grad_norm_max', 'loss_function_name' # <<< Added
+            'lr_decay_cycles', 'clip_grad_norm_max', 'loss_function_name'
         ]
         for hp_key in non_critical_hps_to_update:
             loaded_val = loaded_agent_hps.get(hp_key)
@@ -432,40 +464,27 @@ class DQNAgent:
             if loaded_val is not None and loaded_val != current_val:
                 print(f" Info: Updating HP '{hp_key}' from checkpoint: {current_val} -> {loaded_val}")
                 setattr(self, hp_key, loaded_val)
-                if hp_key == 'loss_function_name': # <<< Re-assign loss_fn if name changed
-                    if self.loss_function_name == "smooth_l1":
-                        self.loss_fn = smooth_l1_loss
-                    elif self.loss_function_name == "mse":
-                        self.loss_fn = mse_loss
+                if hp_key == 'loss_function_name':
+                    if self.loss_function_name == "smooth_l1": self.loss_fn = smooth_l1_loss
+                    elif self.loss_function_name == "mse": self.loss_fn = mse_loss
                     else:
-                        # This should ideally not happen if validation was done at init
                         print(f"WARN: Invalid loss_function_name '{self.loss_function_name}' loaded. Defaulting to smooth_l1.")
                         self.loss_fn = smooth_l1_loss
 
-
-        # Re-initialize optimizer and scheduler if relevant HPs changed
-        self.optimizer = optim.Adam(self.main_net.parameters(), lr=self.lr) # Re-init with potentially new lr
+        self.optimizer = optim.Adam(self.main_net.parameters(), lr=self.lr)
         if self.use_lr_scheduler and self.lr_decay_cycles > 0:
             self.lr_scheduler = LinearLR(self.optimizer, 1.0, self.lr_end_factor, self.lr_decay_cycles)
 
-        # Load optimizer state *after* re-init
         if 'optimizer_state_dict' in agent_state:
              self.optimizer.load_state_dict(agent_state['optimizer_state_dict'])
-
         if 'lr_scheduler_state_dict' in agent_state and self.lr_scheduler:
-            try:
-                self.lr_scheduler.load_state_dict(agent_state['lr_scheduler_state_dict'])
-            except Exception as e:
-                print(f"WARN: Failed to load LR scheduler: {e}")
+            try: self.lr_scheduler.load_state_dict(agent_state['lr_scheduler_state_dict'])
+            except Exception as e: print(f"WARN: Failed to load LR scheduler: {e}")
 
         if 'buffer_checkpoint_state' in agent_state:
-            try:
-                self.replay_buffer.load_buffer_state_from_checkpoint(agent_state['buffer_checkpoint_state'])
-            except ValueError as e:
-                print(f"Error loading buffer state via agent: {e}"); raise
-        else:
-            print("Warning: No 'buffer_checkpoint_state' in agent state.")
-
+            try: self.replay_buffer.load_buffer_state_from_checkpoint(agent_state['buffer_checkpoint_state'])
+            except ValueError as e: print(f"Error loading buffer state via agent: {e}"); raise
+        else: print("Warning: No 'buffer_checkpoint_state' in agent state.")
         self.target_net.eval()
         print("Agent state loaded (FCN).")
 
